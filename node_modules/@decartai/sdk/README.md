@@ -1,0 +1,527 @@
+# Decart SDK
+
+A JavaScript SDK for Decart's models.
+
+## Installation
+
+```bash
+npm install @decartai/sdk
+# or
+pnpm add @decartai/sdk
+# or
+yarn add @decartai/sdk
+```
+
+## Documentation
+
+For complete documentation, guides, and examples, visit:
+**[https://docs.platform.decart.ai/sdks/javascript](https://docs.platform.decart.ai/sdks/javascript)**
+
+## Quick Start
+
+### Real-time Video Transformation
+
+Realtime connections are LiveKit-backed in the SDK. Existing client usage stays the same: provide a
+camera `MediaStream`, choose a realtime model, and handle the transformed remote stream.
+
+```typescript
+import { createDecartClient, models } from "@decartai/sdk";
+
+const model = models.realtime("lucy-restyle-2");
+
+// Get user's camera stream
+const stream = await navigator.mediaDevices.getUserMedia({
+  audio: true,
+  video: { 
+		frameRate: model.fps,
+		width: model.width,
+		height: model.height,
+  }
+});
+
+// Create a client
+const client = createDecartClient({
+  apiKey: "your-api-key-here"
+});
+
+// Connect and transform the video stream
+const realtimeClient = await client.realtime.connect(stream, {
+  model,
+  onRemoteStream: (transformedStream) => {
+    videoElement.srcObject = transformedStream;
+  },
+  initialState: {
+    prompt: {
+      text: "Anime",
+      enhance: true
+    }
+  }
+});
+
+// Change the style on the fly
+realtimeClient.setPrompt("Cyberpunk city");
+
+// Disconnect when done
+realtimeClient.disconnect();
+```
+
+#### Front-camera mirroring
+
+Pre-flip the input stream:
+
+```ts
+const realtimeClient = await client.realtime.connect(stream, {
+  model,
+  mirror: "auto", // or true to always mirror
+  // ...
+});
+```
+
+Options:
+- `false` (default) — never mirror.
+- `"auto"` — mirror when the input track reports `facingMode: "user"` (mobile front cameras).
+- `true` — always mirror (e.g. desktop webcams).
+
+#### Remote audio
+
+The server's audio track is the audio you publish, played back in sync with the transformed video
+(the model adds latency, so the server delays your audio to match). The SDK subscribes to it only
+when your input stream carries an audio track; the remote stream then has both a video and an audio
+track, and you should play the remote audio rather than your local microphone so voice and picture
+stay in sync. A video-only input stream never subscribes, so the remote stream has no audio track and
+iOS does not show the microphone permission prompt that playing out any remote audio would trigger.
+
+#### Fast mode
+
+Fast mode (`speed: "fast"`) serves the session from a higher-compute tier for lower latency and higher throughput; output quality is unchanged. It is currently available for `lucy-2.5` / `lucy-latest` and `lucy-vton-3.6` / `lucy-vton-3.5` / `lucy-vton-latest`, in the US region only, and is billed at 2x the standard realtime rate for those models. Other models ignore the option. Omit it (the default) for standard mode.
+
+```ts
+const realtimeClient = await client.realtime.connect(stream, {
+  model: models.realtime("lucy-2.5"),
+  speed: "fast",
+  // ...
+});
+```
+
+Models that offer fast mode list it in their definition's `supportedSpeeds`:
+
+```ts
+models.realtime("lucy-2.5").supportedSpeeds; // ["fast"]
+models.realtime("lucy-2.1").supportedSpeeds; // undefined
+```
+
+Passing `speed` for a model without the capability logs a warning through the client's logger and the session runs at standard speed.
+
+#### Connect retries and refused sessions
+
+A failed connect is re-dialled up to 5 times with exponential backoff (1 s to 10 s) before
+`connect()` rejects. Two refusals are never retried, because the server would give the same answer:
+a policy close (code 1008) and the API key's concurrent-session limit (close 1013 "Session Limit
+Reached"). The session limit rejects `connect()` on the first attempt with the server's message
+(`Concurrent session limit reached.`); if it lands after the session is established, the session ends
+with a `sessionEnded` event whose `reason` is `"session_limit"`. A capacity refusal (1013 "Try Again
+Later") is transient and still retries.
+
+When the server refuses a dial for lack of capacity it also sends `error_type: "capacity"` and a
+`retry_after` in seconds. `connect()` then waits that long (±20 % jitter, at least 1 s) and dials
+again, for as long as `capacityRetryBudgetMs` allows (default 60 000 ms since the first dial), before
+rejecting with the server's error. `retries: 0` turns these re-dials off too. `onCapacityWait` reports
+each wait so the app can show it:
+
+```ts
+const realtimeClient = await client.realtime.connect(stream, {
+  model,
+  capacityRetryBudgetMs: 30_000,
+  onCapacityWait: ({ retryAfterMs }) => showStatus(`Server busy, retrying in ${Math.round(retryAfterMs / 1000)} s`),
+  // ...
+});
+```
+
+Apps that hand out connects from their own session queue should turn retries off: every retry is a
+fresh dial that takes a freed slot ahead of the people waiting in line.
+
+```ts
+const realtimeClient = await client.realtime.connect(stream, {
+  model,
+  retries: 0, // dial once; on failure, rejoin your own queue
+  // ...
+});
+
+realtimeClient.on("sessionEnded", ({ reason }) => {
+  // "session_limit" | "policy_violation" | "moderation_violation" | "insufficient_credits" | ...
+});
+```
+
+### Watch a Stream
+
+A connected realtime session exposes an SDK `subscribeToken` once it reaches a
+connected state. Share that SDK token with viewers — `client.realtime.subscribe`
+uses it to request receive-only LiveKit credentials from Decart, then connects to
+the LiveKit room for the styled output stream. No viewer camera is required.
+Browser-produced streams can include LiveKit frame metadata for glass-to-glass
+latency, so viewers also need a browser runtime that can create the SDK's
+frame-metadata worker; unsupported runtimes reject those tokens before joining.
+
+> **Viewers must be on this SDK version or newer.** A browser publisher now
+> advertises frame timing by default, which makes the server append a packet
+> trailer to every frame in the room. Viewers on an older `@decartai/sdk`
+> ignore the token's `frame_timing` flag and join without a strip worker — they
+> connect successfully but decode nothing, so the video element stays black with
+> no error raised. React Native viewers cannot strip trailers at all and are
+> rejected with `UNSUPPORTED_PLATFORM_FEATURE`. Upgrade viewers before upgrading
+> publishers.
+
+**Producer** — capture the token from the active session:
+
+```typescript
+const realtimeClient = await client.realtime.connect(stream, {
+  model,
+  onRemoteStream: (transformedStream) => {
+    videoElement.srcObject = transformedStream;
+  },
+});
+
+realtimeClient.on("connectionChange", (state) => {
+  if ((state === "connected" || state === "generating") && realtimeClient.subscribeToken) {
+    const subscribeToken = realtimeClient.subscribeToken;
+    // Pass `subscribeToken` to the viewer snippet below.
+  }
+});
+```
+
+**Viewer** — attach to the producer's stream with the token:
+
+```typescript
+import { createDecartClient, type RealTimeSubscribeClient } from "@decartai/sdk";
+
+const client = createDecartClient({ apiKey: "your-api-key-here" });
+
+const subscriber: RealTimeSubscribeClient = await client.realtime.subscribe({
+  token: subscribeToken,
+  onRemoteStream: (stream) => {
+    videoElement.srcObject = stream;
+  },
+});
+
+subscriber.on("connectionChange", (state) => {
+  console.log(`Viewer state: ${state}`);
+});
+
+// Disconnect when done
+subscriber.disconnect();
+```
+
+### Connection quality
+
+There are two layers: a **preflight** check before connecting, and an **in-session** quality
+signal while connected. Both report on a shared `"good" | "fair" | "poor" | "critical"` scale —
+the SDK reports, you decide what to do (gate the UI, warn the user, etc.).
+
+**Preflight (before connecting).** A fast, network-only reachability check — it spins up a
+throwaway peer connection against public STUN, so there's no session and no cost:
+
+```typescript
+const { quality, metrics, reasons } = await client.realtime.checkConnectivity();
+// metrics: { transport: "udp" | "relay" | "failed", rttMs }
+if (quality === "critical") showFallbackUI(reasons);
+```
+
+**In-session quality.** While connected, the SDK derives a smoothed verdict from WebRTC stats
+(latency, packet loss, bandwidth headroom, frame rate) and tells you which dimension is the
+bottleneck:
+
+```typescript
+const realtimeClient = await client.realtime.connect(stream, {
+  model,
+  onRemoteStream: (s) => { videoElement.srcObject = s; },
+  onConnectionQuality: ({ quality, limitingFactor, metrics }) => {
+    // limitingFactor: "bandwidth" | "latency" | "loss" | "stall" | "cpu" | "none"
+    // metrics: { rttMs, fps, packetLoss, upstreamJitterMs, availableUpstreamKbps, ... }
+    console.log(quality, limitingFactor);
+  },
+});
+
+// also available as an event and a getter:
+realtimeClient.on("connectionQuality", (report) => { /* ... */ });
+realtimeClient.getConnectionQuality(); // latest report, or null before the first sample
+```
+
+> `onConnectionQuality` and the `connectionQuality` event are **debounced** — they only re-fire
+> when the verdict (`quality`/`limitingFactor`) changes, so they're not a live metrics feed. For a
+> continuous read of the raw numbers, updated every stats tick (~1/s), use the `stats` event or
+> poll `getConnectionQuality()?.metrics`:
+>
+> ```typescript
+> realtimeClient.on("stats", (s) => updateLatencyHud(s.glassToGlass?.medianMs, s.video?.framesPerSecond));
+> // or, on your own interval:
+> setInterval(() => console.log(realtimeClient.getConnectionQuality()?.metrics.g2gMs), 1000);
+> ```
+
+**Glass-to-glass latency.** Network RTT hides the dominant cost in real-time video — model
+inference — so a session can read "good" while actually feeling laggy. In browser sessions, the SDK
+automatically attaches a capture timestamp using LiveKit frame metadata when the required worker is
+available; the server propagates it through inference and the SDK matches it to output playout.
+This surfaces **startup** (`ttffMs`) and **steady-state** (`g2gMs`) latency. When present,
+glass-to-glass drives the latency verdict instead of RTT.
+
+> Frame metadata is currently experimental in LiveKit and requires encoded-transform support.
+> It does not alter visible pixels. `g2gDropRatio` remains `null` until frame IDs are propagated
+> through the server pipeline as well as timestamps.
+
+```typescript
+const realtimeClient = await client.realtime.connect(stream, {
+  model,
+});
+
+// g2g updates every stats tick — read it from the `stats` event (the
+// `connectionQuality` verdict is debounced and would go stale between changes):
+realtimeClient.on("stats", ({ glassToGlass }) => {
+  console.log(glassToGlass?.ttffMs, glassToGlass?.medianMs);
+});
+```
+
+For a *measured* verdict before connecting (instead of the network-only check), use the **deep
+probe**: it briefly opens a real session with a synthetic source, measures glass-to-glass, then
+tears it down. It requires a `model` and costs a short GPU session:
+
+```typescript
+const probe = await client.realtime.checkConnectivity({ deep: true, model });
+console.log(probe.quality, probe.metrics.g2gMs, probe.metrics.ttffMs);
+```
+
+### Async Processing (Queue API)
+
+For video generation jobs, use the queue API to submit jobs and poll for results:
+
+```typescript
+import { createDecartClient, models } from "@decartai/sdk";
+
+const client = createDecartClient({
+  apiKey: "your-api-key-here"
+});
+
+// Submit and poll automatically
+const result = await client.queue.submitAndPoll({
+  model: models.video("lucy-latest"),
+  prompt: "Make it look like a watercolor painting",
+  data: videoFile,
+  onStatusChange: (job) => {
+    console.log(`Status: ${job.status}`);
+  }
+});
+
+if (result.status === "completed") {
+  videoElement.src = URL.createObjectURL(result.data);
+} else {
+  console.error("Job failed:", result.error);
+}
+```
+
+Or manage the polling manually:
+
+```typescript
+// Submit the job
+const job = await client.queue.submit({
+  model: models.video("lucy-latest"),
+  prompt: "Make it look like a watercolor painting",
+  data: videoFile
+});
+console.log(`Job ID: ${job.job_id}`);
+
+// Poll for status
+const status = await client.queue.status(job.job_id);
+console.log(`Status: ${status.status}`);
+
+// Get result when completed
+if (status.status === "completed") {
+  const blob = await client.queue.result(job.job_id);
+  videoElement.src = URL.createObjectURL(blob);
+}
+```
+
+### Client Tokens
+
+Mint short-lived client tokens on your server instead of shipping your API key.
+The response also carries a signed JWT (`token`) that any server or edge runtime
+can verify **offline** against the platform's public JWKS — no API key, no
+round-trip to Decart:
+
+```ts
+import { createDecartClient, verifyClientToken, decodeClientToken } from "@decartai/sdk";
+
+const client = createDecartClient({ apiKey: process.env.DECART_API_KEY });
+const { apiKey, token } = await client.tokens.create({ expiresIn: 300, metadata: { service_tier: 0 } });
+
+// Verify offline (EdDSA signature, exp, iss, aud) and read the claims
+const claims = await verifyClientToken(token); // or client.tokens.verify(token)
+claims.serviceTier; // 0
+claims.pool; // "free" for tier 0, otherwise "paid"
+// also: userId, organizationId, apiKeyName, apiKeyId, allowedModels, allowedOrigins,
+// expiresAt, realtimeConcurrentSessionLimit, zeroDataRetention, attribution, raw
+
+// Read claims WITHOUT verifying — no network, no crypto. Untrusted: display/logging only.
+const untrusted = decodeClientToken(token);
+```
+
+The JWKS comes from `https://platform.decart.ai/api/auth/jwks` (the platform
+host, not `baseUrl`) and is cached; the JWT library is loaded lazily so bundles
+that never verify do not ship it. Errors: `TOKEN_INVALID`, `TOKEN_EXPIRED`,
+`TOKEN_VERIFY_ERROR` (JWKS unreachable). Options: `{ jwksUrl, issuer, audience,
+clockTolerance }`. This is an offline check, not an API call. It needs WebCrypto: on
+runtimes without it (React Native) `verify` rejects with `UNSUPPORTED_PLATFORM_FEATURE`;
+`decodeClientToken` works everywhere.
+
+#### Token lifetime: mint right before connecting
+
+Client tokens expire **60 seconds** after minting by default (`expiresIn`, 1-3600 s). A token
+minted on page load or component mount is usually dead by the time the user has granted camera
+access and pressed start, and a reconnect later with the same token is refused too. The SDK reads
+the token's `exp` before every realtime dial (connect, connect retry and reconnect) and rejects an
+expired one with `TOKEN_EXPIRED` instead of dialling: no socket is opened, and the message says how
+long ago it expired. A few seconds of clock skew are tolerated.
+
+Two ways to keep the token fresh:
+
+- Mint it right before `connect()`, after `getUserMedia` and the user's click, and size
+  `expiresIn` to your connect window, e.g. `client.tokens.create({ expiresIn: 300 })`.
+- Pass `apiKeyProvider` instead of (or alongside) `apiKey`. The SDK calls it before every connect
+  and reconnect and dials with what it returns, so each dial carries a token minted for it:
+
+```ts
+const client = createDecartClient({
+  apiKeyProvider: async () => {
+    // Your server: `client.tokens.create(...)` with your permanent API key.
+    const res = await fetch("/api/realtime-token", { method: "POST" });
+    const { apiKey } = await res.json();
+    return apiKey;
+  },
+});
+
+const realtimeClient = await client.realtime.connect(stream, { model, onRemoteStream });
+```
+
+If the provider rejects during `connect()`, `connect()` rejects with that error; during a
+reconnect a provider failure is retried like any other dial failure.
+
+The provider also serves `process`, `queue`, `files` and `tokens`: the SDK calls it right before
+every HTTP request, including each `submitAndPoll` status poll and the result download, so one
+client works for batch jobs too (proxy mode never calls it for HTTP requests). The SDK does not
+cache what it returns; a provider may hand out a token it minted earlier while that token still has
+enough life left. The API checks the token once the request body has fully arrived, so a token used
+for an upload must outlive the upload: mint it with an `expiresIn` that covers your largest upload.
+
+### React Native / Expo
+
+React Native realtime requires [LiveKit's React Native packages](https://github.com/livekit/client-sdk-react-native)
+and an early `registerGlobals()` call. Plain `react-native-webrtc` is not
+supported. SDK imports and `createDecartClient(...)` usage stay the same.
+
+```sh
+npm install @decartai/sdk livekit-client@2.20.1 \
+  @livekit/react-native@2.11.1 \
+  @livekit/react-native-webrtc@144.1.1
+```
+
+Call LiveKit setup from a side-effect module that runs before your router or app
+entrypoint:
+
+```ts
+// livekit-bootstrap.ts
+import { registerGlobals } from "@livekit/react-native";
+
+registerGlobals();
+```
+
+```ts
+// index.ts
+import "./livekit-bootstrap";
+import "expo-router/entry"; // or import your root App component
+```
+
+With the globals registered, realtime usage is the same as on the web. Use the
+model's numeric FPS when configuring native camera capture, then pass that
+`MediaStream` to the SDK:
+
+```ts
+import { createDecartClient, models, resolveFpsNumber } from "@decartai/sdk";
+import { mediaDevices } from "@livekit/react-native-webrtc";
+
+const client = createDecartClient({ apiKey: "your-api-key-here" });
+const model = models.realtime("lucy-2.5");
+const captureFps = resolveFpsNumber(model.fps);
+
+const cameraStream = await mediaDevices.getUserMedia({
+  audio: false,
+  video: {
+    facingMode: "user",
+    frameRate: captureFps,
+    width: model.width,
+    height: model.height,
+  },
+});
+
+const realtimeClient = await client.realtime.connect(cameraStream, {
+  model,
+  preferredVideoCodec: "vp8",
+  onRemoteStream,
+});
+```
+
+For Expo, install the config plugins:
+
+```sh
+npm install @livekit/react-native-expo-plugin@1.0.2 \
+  @config-plugins/react-native-webrtc
+```
+
+Add them to `app.json`:
+
+```json
+{
+  "expo": {
+    "plugins": [
+      "@livekit/react-native-expo-plugin",
+      "@config-plugins/react-native-webrtc"
+    ]
+  }
+}
+```
+
+Run `npx expo prebuild` and rebuild the native app. LiveKit does not run in Expo
+Go. Bare React Native apps must follow LiveKit's native setup instructions.
+
+Outgoing `mirror` and deep connectivity preflight are browser-only and fail with
+`UNSUPPORTED_PLATFORM_FEATURE` on React Native. Mirror the local preview with your
+native video view instead.
+
+## Development
+
+### Setup
+
+```bash
+pnpm install
+```
+
+### Development Commands
+
+- `pnpm build` - Build the project
+- `pnpm dev:example` - Run Vite dev server for examples
+- `pnpm test` - Run unit tests
+- `pnpm test:e2e` - Run end-to-end tests
+- `pnpm typecheck` - Type check with TypeScript
+- `pnpm format` - Format code with Biome
+- `pnpm lint` - Lint code with Biome
+
+### Publishing
+
+1. **Version bump**: Run `pnpm release` to bump the version (this uses `bumpp` to create a new version tag) and push it to GitHub
+2. **Automated publish**: The GitHub Actions workflow will:
+  - Build the project
+  - Publish to npm
+  - Create a GitHub release with changelog
+
+The package is published to npm as `@decartai/sdk`.
+
+## License
+
+MIT
