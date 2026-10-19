@@ -47,8 +47,8 @@ src/
 - Camera permission/start/stop lifecycle isolated in `useCamera`.
 - Manual garment positioning and sizing, camera snapshots, and local snapshot downloads.
 - MediaPipe Pose Landmarker integration for automatic top, dress, and pants positioning, with GPU-to-CPU fallback.
-
 ## Important current limitation
 This is a staged migration, not a feature-for-feature parity release yet. Pose tracking is integrated, but it still needs runtime testing on a real webcam and browser. If model loading or tracking fails, manual positioning remains available. Accessories remain preview-only. Snapshots currently capture the camera frame; compositing the garment overlay into the downloaded image is a follow-up task.
+
 
 Camera access works on `localhost` or an HTTPS deployment and requires browser permission.
